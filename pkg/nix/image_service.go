@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -136,6 +137,14 @@ func (is *imageService) PullImage(ctx context.Context, req *runtime.PullImageReq
 		return nil, err
 	}
 
+	// Create a fully-qualified Docker reference for the image so that
+	// containerd's CRI checkpoint code can find it. The checkpoint check in
+	// CreateContainer does LocalResolve → toContainerdImage → ImageService.Get()
+	// where Get() normalizes bare names to "docker.io/library/<name>:latest".
+	// Without this, CreateContainer fails with CreateContainerError for all
+	// nix-snapshotter images on k8s 1.30+.
+	is.ensureNormalizedRef(ctx, archivePath, img)
+
 	configDesc, err := img.Config(ctx)
 	if err != nil {
 		return nil, err
@@ -146,6 +155,38 @@ func (is *imageService) PullImage(ctx context.Context, req *runtime.PullImageReq
 	return &runtime.PullImageResponse{
 		ImageRef: imageRef,
 	}, nil
+}
+
+// ensureNormalizedRef creates a fully-qualified Docker reference for the image
+// in containerd's image store. The image name is derived from the OCI archive
+// filename (e.g., "nix-image-seed-web.tar" → "docker.io/library/seed-web:latest").
+// This is needed because containerd's CRI checkpoint code in CreateContainer
+// normalizes bare names and looks them up in the image store, which fails if
+// only the nix-prefixed reference exists.
+func (is *imageService) ensureNormalizedRef(ctx context.Context, archivePath string, img client.Image) {
+	// Extract image name from archive filename: "nix-image-<name>.tar" → "<name>"
+	base := strings.TrimSuffix(filepath.Base(archivePath), ".tar")
+	name := strings.TrimPrefix(base, "nix-image-")
+	if name == base {
+		return // Doesn't match expected pattern
+	}
+
+	// Create the fully-qualified Docker reference
+	normalizedRef := "docker.io/library/" + name + ":latest"
+
+	imgService := is.client.ImageService()
+	existing, err := imgService.Get(ctx, img.Name())
+	if err != nil {
+		return
+	}
+	existing.Name = normalizedRef
+	if _, err := imgService.Create(ctx, existing); err != nil {
+		// Ignore already-exists errors, update if target changed
+		if cerr := imgService.Delete(ctx, normalizedRef); cerr == nil {
+			imgService.Create(ctx, existing)
+		}
+	}
+	log.G(ctx).WithField("ref", normalizedRef).Info("[image-service] Created normalized image ref")
 }
 
 // RemoveImage removes the image.
