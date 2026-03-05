@@ -42,6 +42,14 @@
         patches = (args.patches or []) ++ [
           ./patches/k3s-nix-snapshotter.patch
         ];
+        # Patch vendored containerd: treat ErrNotFound in checkpoint
+        # detection as "not a checkpoint image" instead of a hard error.
+        # This fixes a race where the CRI image store hasn't been
+        # populated yet when CreateContainer runs.
+        # Remove when https://github.com/containerd/containerd/issues/XXXX is fixed.
+        preBuild = (args.preBuild or "") + ''
+          patch --forward -p1 < ${./patches/containerd-checkpoint-not-found.patch} || true
+        '';
       });
     };
   };
